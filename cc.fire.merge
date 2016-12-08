@@ -1,0 +1,581 @@
+#!/usr/bin/env node
+const fs = require('fs');
+const util = require('util');
+
+var lostNodesSrc = [];
+var lostComponentsSrc = [];
+var lostPrefabsSrc = [];
+var lostEventsSrc = [];
+var mergeCount = 0;
+
+function object_type(obj)
+{
+    if(typeof obj == 'undefined' || obj == null || typeof obj.__type__ == 'undefined' || obj.__type__ == null)
+        return null;
+    if(obj.__type__ === 'cc.Node')
+        return 'Node';
+    else if(obj.__type__ === 'cc.PrefabInfo')
+        return 'Prefab';
+    else if(obj.__type__ === 'cc.ClickEvent')
+        return 'Event';
+    else if(obj.__type__ === 'cc.Scene')
+        return 'Scene';
+    else if(obj.__type__ === 'cc.SceneAsset')
+        return 'SceneAsset';
+    else if(obj.__type__ === 'cc.Color')
+        return null;
+    else if(obj.__type__ === 'cc.Vec2')
+        return null;
+    else if(obj.__type__ === 'cc.Size')
+        return null;
+    else
+        return 'Component';
+}
+
+function process_node(node, scene, nodeId) {
+    if(typeof node === 'undefined') {
+        throw 'Node undefined';
+    } else if(node == null) {
+        throw 'Node is null';
+    }
+    /*
+    var t = object_type(node);
+    if(t === 'Node') console.log('Process node', node._id);
+    else if(t === 'Component') console.log('Process component', node.__type__);
+    else console.log('Process', t);
+    */
+    if(node.scene) {
+        try {
+            var id = node.scene.__id__;
+            node.scene = process_node(scene[id], scene, id);
+        } catch(err) {
+            console.log('Node', id, 'Error:', err);
+            console.trace();
+        }
+    }
+    if(node._children) {
+        var chs = [];
+        for(var i=0; i<node._children.length; i++) {
+            var id = node._children[i].__id__;
+            try {
+                if(id == nodeId) throw 'Cyclic references found';
+                var ch = process_node(scene[id], scene, id);
+                if(ch.__type__ == 'cc.Node')
+                    chs.push(ch);
+                else {
+                    ch.__processed__ = false;
+                    throw 'Child is not cc.Node';
+                }
+            } catch (err) {
+                console.log('Node', id, 'Error:', err);
+                console.trace();
+                lostNodesSrc.push({parent:node, id:nodeId, child:id});
+            }
+        }
+        node._children = chs;
+    } 
+    if(node._components) {
+        var comps = [];
+        for(var i=0; i<node._components.length; i++) {
+            var id = node._components[i].__id__;
+            try {
+                if(id == nodeId) throw 'Cyclic references found';
+                var comp = process_node(scene[id], scene, id);
+                if(comp.__type__ !== 'cc.Node') {
+                    comps.push(comp);
+                } else {
+                    comp.__processed__ = false;
+                    throw 'Component is cc.Node';
+                }
+            } catch (err) {
+                console.log('Node', id, 'Error:', err);
+                console.trace();
+                lostComponentsSrc.push({parent:node, id:nodeId, child:id});
+            }
+        }
+        node._components = comps;
+    }
+    if(node._prefab) {
+        var id = node._prefab.__id__;
+        try {
+            if(id == nodeId) throw 'Cyclic references found';
+            var prefab = process_node(scene[id], scene, id);
+            if(prefab.__type__ == 'cc.PrefabInfo') {
+                node._prefab = prefab;
+            } else {
+                prefab.__processed__ = false;
+                throw 'Prefab is not cc.PrefabInfo';
+            }
+        } catch(err) {
+            console.log('Node', id, 'Error:', err);
+            console.trace();
+            lostPrefabsSrc.push({parent:node, id:nodeId, child:id});
+        }
+    }
+    if(node.clickEvents) {
+        var events = [];
+        for(var i=0; i<node.clickEvents.length; i++) {
+            var id = node.clickEvents[i].__id__;
+            try {
+                if(id == nodeId) throw 'Cyclic references found';
+                var event = process_node(scene[id], scene, id);
+                if(event.__type__ !== 'cc.ClickEvent') {
+                    event.__processed__ = false;
+                    throw 'Event is not cc.ClickEvent';
+                } else {
+                    events.push(event);
+                }
+            } catch (err) {
+                console.log('Node', id, 'Error:', err);
+                console.trace();
+                lostEventsSrc.push({parent:node, id:nodeId, child:id});
+            }
+        }
+        node.clickEvents = events;
+    }
+    var t = object_type(node);
+    if(t === 'Component') {
+        for(var property in node) {
+            if(node.hasOwnProperty(property)) {
+                var pr = node[property];
+                if(pr && pr.__id__) {
+                    node[property] = scene[pr.__id__];
+                } else if(Array.isArray(pr)) {
+                    for(var i=0; i<pr.length; i++) {
+                        if(pr[i] && pr[i].__id__) {
+                            pr[i] = scene[pr[i].__id__];
+                        }
+                    }
+                }
+            }
+        }
+    } else if(t === 'Event') {
+        if(node.target && node.target.__id__) {
+            node.target = scene[node.target.__id__];
+        }
+    }
+    node.__processed__ = true;
+    return node;
+}
+
+function print_node(node, gap, addon) {
+    gap = gap || 0;
+    addon = addon || '';
+    console.log("%s%s %s", Array(gap + 1).join(" "), addon, node.__type__, node._name);
+    if(node.scene) {
+        print_node(node.scene, gap+1);
+    } else if(node._children) {
+        for(var i=0; i<node._children.length; i++) {
+            print_node(node._children[i], gap+1);
+        }
+    }
+    if(node._components) {
+        for(var i=0; i<node._components.length; i++) {
+            print_node(node._components[i], gap+1, '+');
+        }
+    }
+}
+
+function load_scene(file)
+{
+    try {
+        var json = JSON.parse(fs.readFileSync(file, 'utf8'));
+        var root = process_node(json[0], json, 0);
+        //print_node(root);
+
+        for(var i=0; i<lostNodesSrc.length; i++) {
+            console.log('Lost child node', lostNodesSrc[i].child, 'from', lostNodesSrc[i].id);
+        }
+        for(var i=0; i<lostComponentsSrc.length; i++) {
+            console.log('Lost component', lostComponentsSrc[i].child, 'from', lostComponentsSrc[i].id);
+        }
+        for(var i=0; i<lostPrefabsSrc.length; i++) {
+            console.log('Lost prefab', lostPrefabsSrc[i].child, 'from', lostPrefabsSrc[i].id);
+        }
+        for(var i=0; i<lostEventsSrc.length; i++) {
+            console.log('Lost event', lostEventsSrc[i].child, 'from', lostEventsSrc[i].id);
+        }
+        var homeless = 0;
+        for(var i=0; i<json.length; i++) {
+            var node = json[i];
+            if(node.__processed__) {
+                
+            } else {
+                console.log('Homeless node:', i, node.__type__, node._name);
+                homeless += 1;
+            }
+        }
+        console.log('Result: ', json.length, 'objects, ', lostNodesSrc.length, 'lost nodes, ', lostComponentsSrc.length, 'lost components, ', lostEventsSrc.length, 'lost events, ', lostPrefabsSrc.length, 'lost prefabs, ', homeless, 'homeless objects');
+        return root;
+    } catch(err) {
+        console.log('Error:', err);
+        console.trace();
+        return null;
+    }
+}
+
+function same_objects(obj1, obj2)
+{
+    var t1 = object_type(obj1);
+    var t2 = object_type(obj2);
+    if(t1 !== t2) return false;
+    if(t1 === 'Node') {
+        return obj1._id == obj2._id;
+    } else if(t1 === 'Prefab') {
+        return obj1.fileId == obj2.fileId;
+    } else if(t1 === 'Event') {
+        return obj1.component == obj2.component && obj1.handler == obj2.handler;
+    } else if(t1 === 'Scene') {
+        return obj1._id == obj2._id;
+    } else if(t1 === 'SceneAsset') {
+        return true;
+    } else if(t1 === 'Component') {
+        return obj1.__type__ == obj2.__type__;
+    }
+}
+
+function merge_objects(obj1, obj2)
+{
+    if((typeof obj1 === 'undefined' || obj1 == null) && (typeof obj2 == 'undefined' || obj2 == null))
+        return null;
+    else if (typeof obj1 === 'undefined' || obj1 == null)
+        return obj2;
+    else if (typeof obj2 == 'undefined' || obj2 == null)
+        return obj1;
+    var t1 = object_type(obj1);
+    var t2 = object_type(obj2);
+    if(t1 !== t2) {
+        throw 'Merge objects with types '+t1+' and '+t2;
+    }
+    /*
+    if(t1 === 'Node')
+        console.log('Merge', t1, obj1._id, obj2._id);
+    else if(t1 === 'Component')
+        console.log('Merge', t1, obj1.__type__, obj2.__type__);
+    else
+        console.log('Merge', t1);
+    */
+    if(t1 === 'SceneAsset') {
+        var scene = merge_objects(obj1.scene, obj2.scene);
+        var result = Object.assign({}, obj1, obj2, {scene: scene});
+        delete result.__processed__;
+        mergeCount += 1;
+        return result;
+    } else if(t1 === 'Scene') {
+        var chs = merge_arrays(obj1._children, obj2._children);
+        var result = Object.assign({}, obj1, obj2, {_children: chs});
+        delete result.__processed__;
+        mergeCount += 1;
+        return result;
+    } else if(t1 === 'Node') {
+        var chs = merge_arrays(obj1._children, obj2._children);
+        var comps = merge_arrays(obj1._components, obj2._components);
+        var prefab = merge_objects(obj1._prefab, obj2._prefab);
+        var result = Object.assign({}, obj1, obj2, {_children: chs, _components: comps, _prefab: prefab});
+        delete result.__processed__;
+        mergeCount += 1;
+        return result;
+    } else if(t1 === 'Component') {
+        var events = merge_arrays(obj1.clickEvents, obj2.clickEvents);
+        var result = null;
+        if(events != null)
+            result = Object.assign({}, obj1, obj2, {clickEvents: events});
+        else
+            result = Object.assign({}, obj1, obj2);
+        delete result.__processed__;
+        mergeCount += 1;
+        return result;
+    } else if(t1 === 'Event') {
+        var result = Object.assign({}, obj1, obj2);
+        delete result.__processed__;
+        mergeCount += 1;
+        return result;
+    } else if(t1 === 'Prefab') {
+        var result = Object.assign({}, obj1, obj2);
+        delete result.__processed__;
+        mergeCount += 1;
+        return result;
+    } else {
+        console.log('Unknown type', t1);
+        return null;
+    }
+}
+
+function merge_arrays(arr1, arr2)
+{
+    if((typeof arr1 === 'undefined' || arr1 == null || arr1.length == 0) && (typeof arr2 == 'undefined' || arr2 == null || arr2.length == 0))
+        return null;
+    else if(typeof arr2 === 'undefined' || arr2 == null || arr2.length == 0)
+        return arr1;
+    else if(typeof arr1 === 'undefined' || arr1 == null || arr1.length == 0)
+        return arr2;
+    var t1 = null;
+    for(var i=0; i<arr1.length; i++) {
+        var t2 = object_type(arr1[i]);
+        if(t1 == null) t1 = t2;
+        else {
+            if(t1 !== t2) {
+                throw 'Merge objects with types '+t1+' and '+t2;
+            }
+        }
+    }
+    for(var i=0; i<arr2.length; i++) {
+        var t2 = object_type(arr2[i]);
+        if(t1 !== t2) {
+            throw 'Merge objects with types '+t1+' and '+t2;
+        }
+    }
+    var array1 = arr1.slice();
+    var array2 = arr2.slice();
+    var result = [];
+    for(var i=0; i<array1.length; i++) {
+        var obj1 = array1[i];
+        var found = false;
+        for(var j=0; j<array2.length; j++) {
+            var obj2 = array2[j];
+            if(same_objects(obj1, obj2)) {
+                var obj = merge_objects(obj1, obj2);
+                result.push(obj);
+                array2.splice(j, 1);
+                found = true;
+                break;
+            }
+        }
+        if(!found) {
+            mergeCount += 1;
+            result.push(obj1);
+        }
+    }
+    for(var i=0; i<array2.length; i++) {
+        var obj2 = array2[i];
+        mergeCount += 1;
+        result.push(obj2);
+    }
+    return result;
+}
+
+function deduplicate_nodes(cache, obj, parent)
+{
+    var newNode = null;
+    var t = object_type(obj);
+    if(t === 'SceneAsset') {
+        var n = deduplicate_nodes(cache, obj.scene, obj);
+        if(n != null) obj.scene = n;
+    } else if(t === 'Scene') {
+        //console.log('Checking node', obj._id);
+        cache[obj._id] = {node: obj, parent: parent};
+        for(var i=0; i<obj._children.length; i++) {
+            var n = deduplicate_nodes(cache, obj._children[i], obj);
+            if(n != null) obj._children[i] = n;
+        }
+    } else if(t === 'Node') {
+        //console.log('Checking node', obj._id);
+        var node = obj;
+        var prev = cache[node._id];
+        if(typeof prev === 'undefined' || prev == null) {
+            cache[node._id] = {node: node, parent: parent};
+        } else {
+            console.log('Found duplicate for node', node._id, node._name);
+            node = merge_objects(prev.node, node);
+            newNode = node;
+            var chs = prev.parent._children;
+            for(var j=0; j<chs.length; j++) {
+                if(chs[j] === prev.node) {
+                    prev.parent._children.splice(j, 1);
+                    break;
+                }
+            }
+            cache[node._id] = {node: node, parent: parent};
+        }
+        if(node._children && node._children.length > 0) {
+            for(var i=0; i<node._children.length; i++) {
+                var n = deduplicate_nodes(cache, node._children[i], node);
+                if(n != null) node._children[i] = n;
+            }
+        }
+    }
+    return newNode;
+}
+
+function merge_scenes(root1, root2)
+{
+    mergeCount = 1;
+    var root3 = merge_objects(root1, root2);
+    var cache = {};
+    deduplicate_nodes(cache, root3, null);
+    return root3;
+}
+
+function object_index(json, object, insert)
+{
+    for(var i=0; i<json.length; i++) {
+        if(json[i] === object) {
+            return i;
+        }
+    }
+    if(insert) {
+        json.push(object);
+        return json.length - 1;
+    } else {
+        return null;
+    }
+}
+
+function serialize_object(json, obj)
+{
+    var ind = object_index(json, obj, true);
+    var t = object_type(obj);
+    if(t === 'SceneAsset') {
+        var scene = serialize_object(json, obj.scene);
+        obj.scene = {__id__: scene};
+    } else if(t === 'Scene') {
+        var chs = [];
+        for(var i=0; i<obj._children.length; i++) {
+            obj._children[i]._parent = {__id__:ind};
+            var ch = serialize_object(json, obj._children[i]);
+            chs.push({__id__: ch});
+        }
+        obj._children = chs;
+    } else if(t === 'Node') {
+        var comps = [];
+        if(obj._components) {
+            for(var i=0; i<obj._components.length; i++) {
+                obj._components[i].node = {__id__:ind};
+                var cm = serialize_object(json, obj._components[i]);
+                comps.push({__id__: cm});
+            }
+        }
+        obj._components = comps;
+        var chs = [];
+        if(obj._children) {
+            for(var i=0; i<obj._children.length; i++) {
+                obj._children[i]._parent = {__id__:ind};
+                var ch = serialize_object(json, obj._children[i]);
+                chs.push({__id__: ch});
+            }
+        }
+        obj._children = chs;
+        if(obj._prefab) {
+            obj._prefab.root = {__id__:ind};
+            var prefab = serialize_object(json, obj._prefab);
+            obj._prefab = {__id__: prefab};
+        }
+    } else if(t === 'Component') {
+        if(obj.clickEvents) {
+            var evs = [];
+            for(var i=0; i<obj.clickEvents.length; i++) {
+                var ev = serialize_object(json, obj.clickEvents[i]);
+                evs.push({__id__: ev});
+            }
+            obj.clickEvents = evs;
+        }
+    } else if(t === 'Event') {
+
+    } else if(t === 'Prefab') {
+
+    } else {
+        console.log('Unknown type', t);
+    }
+    return ind;
+}
+
+function find_object(json, ob)
+{
+    var ind = object_index(json, ob);
+    if(ind != null) {
+        return ind;
+    } else {
+        var t = object_type(ob);
+        var completed = false;
+        if(t == 'Node') {
+            for(var j=0; j<json.length; j++) {
+                var n = json[j];
+                if(same_objects(n, ob)) {
+                    return j;
+                }
+            }
+        } else if(t == 'Component') {
+            var n1 = ob.node;
+            for(var j=0; j<json.length; j++) {
+                var n2 = json[j];
+                if(same_objects(n1, n2)) {
+                    for(var c=0; c<n2._components.length; c++) {
+                        var c_id = n2._components[c].__id__;
+                        var comp2 = json[c_id];
+                        if(same_objects(ob, comp2)) {
+                            return c_id;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return null;
+}
+
+function flatten_components(json)
+{
+    for(var i=0; i<json.length; i++) {
+        var obj = json[i];
+        var t = object_type(obj);
+        if(t == 'Component') {
+            for(var property in obj) {
+                if(obj.hasOwnProperty(property)) {
+                    var pr = obj[property];
+                    if(Array.isArray(pr)) {
+                        for(var j=0; j<pr.length; j++) {
+                            var ind = find_object(json, pr[j]);
+                            if(ind != null)
+                                pr[j] = {__id__: ind};
+                        }
+                    } else {
+                        var ind = find_object(json, pr);
+                        if(ind != null)
+                            obj[property] = {__id__: ind};
+                    }
+                }
+            }
+        } else if(t == 'Event') {
+            if(obj.target) {
+                var ind = find_object(json, obj.target);
+                if(ind != null)
+                    obj.target = {__id__: ind};
+            }
+        }
+    }
+}
+
+function serialize_scene(object)
+{
+    var json = [];
+    serialize_object(json, object);
+    flatten_components(json);
+    return json;
+}
+
+if(process.argv.length <= 3) {
+    console.log('CC FireMerge');
+    console.log('Usage: cc.fire.merge first_scene.fire, second_scene.fire');
+} else {
+    var scene1 = process.argv[2];
+    console.log('CC FireFix: processing', scene1);
+    var root1 = load_scene(scene1);
+    //print_node(root1);
+
+    var scene2 = process.argv[3];
+    console.log('CC FireFix: processing', scene2);
+    var root2 = load_scene(scene2);
+    //print_node(root2);
+
+    var root3 = merge_scenes(root1, root2);
+    console.log('Merged', mergeCount, 'nodes');
+    //print_node(root3);
+
+    var json = serialize_scene(root3);
+    //var txt = util.inspect(json, {depth: 3})
+    var txt = JSON.stringify(json, null, 2);
+    fs.writeFileSync('merge_out.fire', txt);
+}
+
+
+
